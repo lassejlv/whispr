@@ -54,9 +54,11 @@ fn main() -> Result<()> {
             .expect("spawn pipeline thread");
     }
 
-    gpui_platform::application().run(move |cx| {
-        ui::boot(cx, handle.clone(), ui_rx.clone(), tray_rx.clone(), tray_tx.clone());
-    });
+    gpui_platform::application()
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx| {
+            ui::boot(cx, handle.clone(), ui_rx.clone(), tray_rx.clone(), tray_tx.clone());
+        });
 
     drop(runtime);
     Ok(())

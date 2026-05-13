@@ -11,7 +11,7 @@ use crate::hotkey::HotkeyEvent;
 use crate::llm::LlmClient;
 use crate::output;
 use crate::storage::{Recording, Store};
-use crate::stt::SttClient;
+use crate::stt;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
@@ -157,15 +157,19 @@ async fn pipeline(handle: AppHandle, samples: Vec<i16>) -> Result<()> {
     let duration_ms = (samples.len() as i64 * 1000) / TARGET_SAMPLE_RATE as i64;
 
     handle.set_state(|s| s.phase = Phase::Transcribing);
-    let wav = wav_bytes(&samples)?;
 
     let (rec_id, wav_path) = store.new_recording_path();
     let wav_path_str = wav_path.display().to_string();
-    let wav_for_disk = wav.clone();
-    tokio::task::spawn_blocking(move || std::fs::write(&wav_path, wav_for_disk)).await??;
+    let samples_for_disk = samples.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let wav = wav_bytes(&samples_for_disk)?;
+        std::fs::write(&wav_path, wav)?;
+        Ok(())
+    })
+    .await??;
 
-    let stt = SttClient::new(cfg.openai_api_key.clone(), cfg.stt_model.clone());
-    let raw = stt.transcribe(wav, None).await?;
+    let transcriber = stt::build(&cfg);
+    let raw = transcriber.transcribe(samples).await?;
 
     let cleaned = if cfg.cleanup_enabled && !raw.is_empty() {
         handle.set_state(|s| s.phase = Phase::Cleaning);

@@ -13,7 +13,7 @@ use gpui_component::{
 };
 
 use crate::app::AppHandle;
-use crate::config::OutputMode;
+use crate::config::{OutputMode, SttBackend};
 use crate::storage::Recording;
 
 actions!(whispr, [OpenSettings, SaveSettings]);
@@ -55,6 +55,7 @@ pub struct SettingsView {
     vocabulary: Entity<InputState>,
     cleanup_enabled: bool,
     output_mode: OutputMode,
+    stt_backend: SttBackend,
     recordings: Vec<Recording>,
     save_status: Option<SharedString>,
 }
@@ -87,6 +88,7 @@ impl SettingsView {
             vocabulary,
             cleanup_enabled: cfg.cleanup_enabled,
             output_mode: cfg.output_mode,
+            stt_backend: cfg.stt_backend,
             recordings: Vec::new(),
             save_status: None,
         };
@@ -133,6 +135,7 @@ impl SettingsView {
         cfg.cleanup_prompt = self.cleanup_prompt.read(cx).value().to_string();
         cfg.cleanup_enabled = self.cleanup_enabled;
         cfg.output_mode = self.output_mode.clone();
+        cfg.stt_backend = self.stt_backend;
         cfg.vocabulary = self
             .vocabulary
             .read(cx)
@@ -257,6 +260,8 @@ impl SettingsView {
         let theme = cx.theme();
         let paste_selected = matches!(self.output_mode, OutputMode::Paste);
         let type_selected = matches!(self.output_mode, OutputMode::Type);
+        let backend_openai = matches!(self.stt_backend, SttBackend::OpenAi);
+        let backend_parakeet = matches!(self.stt_backend, SttBackend::Parakeet);
 
         div()
             .id("general-scroll")
@@ -272,6 +277,53 @@ impl SettingsView {
                 "Configure dictation, models, and output.",
                 cx,
             ))
+            .child(
+                card(cx).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(Label::new("Speech-to-Text Backend").text_sm())
+                                .child(
+                                    Label::new(
+                                        "OpenAI uses gpt-4o-transcribe (cloud). Parakeet runs \
+                                         NVIDIA's TDT model locally via CoreML (≈600 MB on first \
+                                         use).",
+                                    )
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("backend-openai")
+                                        .label("OpenAI Cloud")
+                                        .selected(backend_openai)
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.stt_backend = SttBackend::OpenAi;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("backend-parakeet")
+                                        .label("Parakeet (Local)")
+                                        .selected(backend_parakeet)
+                                        .on_click(cx.listener(|this, _, _w, cx| {
+                                            this.stt_backend = SttBackend::Parakeet;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                ),
+            )
             .child(card(cx).child(field(
                 "OpenAI API Key",
                 "Stored locally. Used for transcription and cleanup.",

@@ -41,6 +41,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 tray-icon = "0.21"
 
+scriptrs = { version = "0.2", features = ["long-form"] }
+async-trait = "0.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
 core-foundation = "0.10"

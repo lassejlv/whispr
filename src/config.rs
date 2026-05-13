@@ -16,6 +16,19 @@ impl Default for OutputMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SttBackend {
+    OpenAi,
+    Parakeet,
+}
+
+impl Default for SttBackend {
+    fn default() -> Self {
+        Self::OpenAi
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -38,6 +51,9 @@ pub struct Config {
 
     #[serde(default)]
     pub output_mode: OutputMode,
+
+    #[serde(default)]
+    pub stt_backend: SttBackend,
 }
 
 impl Default for Config {
@@ -50,6 +66,7 @@ impl Default for Config {
             cleanup_prompt: default_cleanup_prompt(),
             vocabulary: Vec::new(),
             output_mode: OutputMode::default(),
+            stt_backend: SttBackend::default(),
         }
     }
 }

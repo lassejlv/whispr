@@ -9,12 +9,14 @@ use gpui_component::{
     input::{Input, InputState},
     label::Label,
     switch::Switch,
-    ActiveTheme, Icon, IconName, Root, Selectable, Sizable, TitleBar,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, TitleBar,
 };
 
 use crate::app::AppHandle;
 use crate::config::{OutputMode, SttBackend};
 use crate::storage::Recording;
+use crate::stt::parakeet::{self, ModelStatus};
+use std::time::Duration;
 
 actions!(whispr, [OpenSettings, SaveSettings]);
 
@@ -56,6 +58,7 @@ pub struct SettingsView {
     cleanup_enabled: bool,
     output_mode: OutputMode,
     stt_backend: SttBackend,
+    parakeet_status: ModelStatus,
     recordings: Vec<Recording>,
     save_status: Option<SharedString>,
 }
@@ -89,9 +92,28 @@ impl SettingsView {
             cleanup_enabled: cfg.cleanup_enabled,
             output_mode: cfg.output_mode,
             stt_backend: cfg.stt_backend,
+            parakeet_status: parakeet::status(),
             recordings: Vec::new(),
             save_status: None,
         };
+
+        let bg = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                bg.timer(Duration::from_millis(500)).await;
+                let s = parakeet::status();
+                let result = this.update(cx, |v: &mut SettingsView, cx| {
+                    if v.parakeet_status != s {
+                        v.parakeet_status = s;
+                        cx.notify();
+                    }
+                });
+                if result.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn({
             let h = view.handle.clone();
             async move |this, cx| {
@@ -155,6 +177,25 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn download_parakeet(&mut self, cx: &mut Context<Self>) {
+        let h = self.handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = h
+                .rt()
+                .spawn_blocking(parakeet::preload)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")));
+            if let Err(e) = result {
+                tracing::error!(error = ?e, "Parakeet download failed");
+            }
+            let _ = this.update(cx, |v: &mut SettingsView, cx| {
+                v.parakeet_status = parakeet::status();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn delete_recording(&mut self, id: String, cx: &mut Context<Self>) {
         let h = self.handle.clone();
         cx.spawn(async move |this, cx| {
@@ -174,6 +215,7 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let font_family = theme.font_family.clone();
 
         div()
             .size_full()
@@ -181,6 +223,8 @@ impl Render for SettingsView {
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .text_size(px(13.))
+            .font_family(font_family)
             .child(custom_title_bar(cx))
             .child(
                 div()
@@ -257,7 +301,7 @@ impl SettingsView {
     }
 
     fn general_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let paste_selected = matches!(self.output_mode, OutputMode::Paste);
         let type_selected = matches!(self.output_mode, OutputMode::Type);
         let backend_openai = matches!(self.stt_backend, SttBackend::OpenAi);
@@ -324,6 +368,7 @@ impl SettingsView {
                         ),
                 ),
             )
+            .child(self.parakeet_card(cx))
             .child(card(cx).child(field(
                 "OpenAI API Key",
                 "Stored locally. Used for transcription and cleanup.",
@@ -420,6 +465,82 @@ impl SettingsView {
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     ),
             )
+    }
+
+    fn parakeet_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (status_text, status_color) = match &self.parakeet_status {
+            ModelStatus::NotLoaded => ("Not downloaded", theme.muted_foreground),
+            ModelStatus::Downloading => ("Downloading…", theme.info),
+            ModelStatus::Ready => ("Ready", theme.success),
+            ModelStatus::Failed(_) => ("Failed", theme.danger),
+        };
+        let busy = self.parakeet_status.is_busy();
+        let ready = self.parakeet_status.is_ready();
+
+        let failure_msg = match &self.parakeet_status {
+            ModelStatus::Failed(e) => Some(e.clone()),
+            _ => None,
+        };
+
+        let mut body = div().flex().flex_col().gap_3();
+        body = body.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(Label::new("Local Model — Parakeet TDT v2").text_sm())
+                        .child(
+                            Label::new(
+                                "≈600 MB CoreML bundle from Hugging Face. Cached locally after \
+                                 first download.",
+                            )
+                            .text_xs()
+                            .text_color(theme.muted_foreground),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(status_color),
+                        )
+                        .child(
+                            Label::new(status_text.to_string())
+                                .text_xs()
+                                .text_color(status_color),
+                        ),
+                ),
+        );
+
+        if let Some(msg) = failure_msg {
+            body = body.child(
+                Label::new(msg)
+                    .text_xs()
+                    .text_color(theme.danger),
+            );
+        }
+
+        body = body.child(
+            div().flex().justify_end().child(
+                Button::new("parakeet-download")
+                    .label(if ready { "Re-download" } else { "Download Model" })
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _w, cx| this.download_parakeet(cx))),
+            ),
+        );
+
+        card(cx).child(body)
     }
 
     fn recordings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {

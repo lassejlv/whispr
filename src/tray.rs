@@ -22,7 +22,7 @@ mod imp {
         unsafe impl ClassType for TrayTarget {
             type Super = NSObject;
             type Mutability = mutability::InteriorMutable;
-            const NAME: &'static str = "WhisprTrayTarget";
+            const NAME: &'static str = "YapTrayTarget";
         }
 
         impl DeclaredClass for TrayTarget {}
@@ -42,8 +42,8 @@ mod imp {
                 }
             }
 
-            #[method(hideWhispr:)]
-            fn hide_whispr(&self, _sender: Option<&AnyObject>) {
+            #[method(hideYap:)]
+            fn hide_yap(&self, _sender: Option<&AnyObject>) {
                 if let Some(tx) = TRAY_TX.get() {
                     let _ = tx.send(UiCmd::Hide);
                 }
@@ -91,7 +91,7 @@ mod imp {
         let quit_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Quit whispr"),
+                &NSString::from_str("Quit Yap"),
                 Some(sel!(quit:)),
                 &NSString::from_str("q"),
             )
@@ -137,8 +137,8 @@ mod imp {
         let hide_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Hide whispr"),
-                Some(sel!(hideWhispr:)),
+                &NSString::from_str("Hide Yap"),
+                Some(sel!(hideYap:)),
                 &NSString::from_str("m"),
             )
         };
@@ -150,7 +150,7 @@ mod imp {
         let quit_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc::<NSMenuItem>(),
-                &NSString::from_str("Quit whispr"),
+                &NSString::from_str("Quit Yap"),
                 Some(sel!(quit:)),
                 &NSString::from_str("q"),
             )

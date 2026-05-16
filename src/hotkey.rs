@@ -27,7 +27,7 @@ mod imp {
 
     pub fn spawn(tx: Sender<HotkeyEvent>, settings: SharedSettings) {
         thread::Builder::new()
-            .name("whispr-hotkey".into())
+            .name("yap-hotkey".into())
             .spawn(move || run_loop(tx, settings))
             .expect("spawn hotkey thread");
     }

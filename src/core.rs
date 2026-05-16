@@ -23,7 +23,7 @@ pub fn spawn(
     settings: SharedSettings,
 ) {
     thread::Builder::new()
-        .name("whispr-core".into())
+        .name("yap-core".into())
         .spawn(move || run(hotkey_rx, cmd_rx, ev_tx, settings))
         .expect("spawn core");
 }

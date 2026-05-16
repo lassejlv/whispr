@@ -123,7 +123,7 @@ async fn open_settings(app: &gpui::Entity<AppModel>, cx: &mut AsyncApp) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             kind: WindowKind::Normal,
             titlebar: Some(TitlebarOptions {
-                title: Some("whispr".into()),
+                title: Some("yap".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(14.0), px(14.0))),
             }),

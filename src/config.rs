@@ -10,9 +10,13 @@ pub const MODEL_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8";
 pub const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
 
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| std::env::temp_dir())
-        .join("whispr")
+    let base = dirs::data_dir().unwrap_or_else(|| std::env::temp_dir());
+    let new_dir = base.join("yap");
+    let legacy = base.join("whispr");
+    if !new_dir.exists() && legacy.exists() {
+        let _ = std::fs::rename(&legacy, &new_dir);
+    }
+    new_dir
 }
 
 pub fn models_dir() -> PathBuf {

@@ -340,7 +340,7 @@ fn render_sidebar(app: Entity<AppModel>, current: SettingsSection) -> AnyElement
                 .py_2()
                 .text_sm()
                 .text_color(theme::text_secondary())
-                .child("whispr"),
+                .child("yap"),
         )
         .children(SettingsSection::ALL.into_iter().map(|s| {
             let app = app.clone();

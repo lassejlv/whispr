@@ -4,6 +4,7 @@ mod config;
 mod core;
 mod history;
 mod hotkey;
+mod keychain;
 mod model;
 mod paste;
 mod state;
@@ -138,7 +139,7 @@ async fn open_settings(app: &gpui::Entity<AppModel>, cx: &mut AsyncApp) {
             ..Default::default()
         },
         move |window, cx| {
-            let v = cx.new(|cx| SettingsView::new(app.clone(), cx));
+            let v = cx.new(|cx| SettingsView::new(app.clone(), window, cx));
             cx.new(|cx| Root::new(v, window, cx))
         },
     );

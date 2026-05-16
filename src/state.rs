@@ -12,6 +12,7 @@ pub enum Phase {
     Recording,
     Transcribing,
     NeedsModel,
+    NeedsApiKey,
 }
 
 #[derive(Debug, Clone)]

@@ -7,13 +7,14 @@ use std::thread;
 use std::time::Duration;
 
 use crate::audio::Recorder;
-use crate::config::{SharedSettings, parakeet_dir};
+use crate::config::{BackendKind, SharedSettings, parakeet_dir};
 use crate::history::HistoryStore;
 use crate::hotkey::HotkeyEvent;
+use crate::keychain;
 use crate::model::{Progress, ProgressSink, download_parakeet};
 use crate::paste::paste_text;
 use crate::state::{CoreCmd, CoreEvent, Phase};
-use crate::stt::{ModelPaths, Stt};
+use crate::stt::{ModelPaths, OpenAiStt, ParakeetStt, Stt};
 use crate::text::normalize_transcript;
 
 pub fn spawn(
@@ -46,7 +47,7 @@ fn run(
     };
     let vu_tick = tick(Duration::from_millis(50));
 
-    try_load_stt(&mut stt, &ev_tx);
+    try_load_stt(&mut stt, &settings, &ev_tx);
     publish_history(history.as_ref(), &ev_tx);
 
     loop {
@@ -56,8 +57,19 @@ fn run(
                 match ev {
                     HotkeyEvent::Pressed => {
                         if stt.is_none() {
-                            let _ = ev_tx.send(CoreEvent::Log("model not loaded — open Settings".into()));
-                            let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::NeedsModel));
+                            let backend = settings.read().backend;
+                            let (msg, phase) = match backend {
+                                BackendKind::OpenAi => (
+                                    "OpenAI API key not set — open Settings",
+                                    Phase::NeedsApiKey,
+                                ),
+                                BackendKind::Parakeet => (
+                                    "model not loaded — open Settings",
+                                    Phase::NeedsModel,
+                                ),
+                            };
+                            let _ = ev_tx.send(CoreEvent::Log(msg.into()));
+                            let _ = ev_tx.send(CoreEvent::PhaseChanged(phase));
                             continue;
                         }
                         match Recorder::start() {
@@ -81,7 +93,15 @@ fn run(
                         }
                         let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::Transcribing));
                         let Some(s) = stt.as_mut() else { continue };
-                        let raw_text = s.transcribe(&samples);
+                        let raw_text = match s.transcribe(&samples) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!("transcribe failed: {e:#}");
+                                let _ = ev_tx.send(CoreEvent::Log(format!("transcribe failed: {e}")));
+                                let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::Idle));
+                                continue;
+                            }
+                        };
                         let output_text = normalize_transcript(&raw_text);
                         if let Some(history) = history.as_mut() {
                             if let Err(e) = history.save_recording(&samples, &raw_text, &output_text) {
@@ -108,7 +128,7 @@ fn run(
                     CoreCmd::StartDownload => spawn_download(ev_tx.clone()),
                     CoreCmd::ReloadModel => {
                         stt = None;
-                        try_load_stt(&mut stt, &ev_tx);
+                        try_load_stt(&mut stt, &settings, &ev_tx);
                     }
                 }
             }
@@ -138,8 +158,50 @@ fn publish_history(history: Option<&HistoryStore>, ev_tx: &Sender<CoreEvent>) {
     }
 }
 
-fn try_load_stt(stt: &mut Option<Stt>, ev_tx: &Sender<CoreEvent>) {
+fn try_load_stt(stt: &mut Option<Stt>, settings: &SharedSettings, ev_tx: &Sender<CoreEvent>) {
     let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::LoadingModel));
+    let snapshot = settings.read().clone();
+    match snapshot.backend {
+        BackendKind::OpenAi => load_openai(stt, &snapshot, ev_tx),
+        BackendKind::Parakeet => load_parakeet(stt, ev_tx),
+    }
+}
+
+fn load_openai(
+    stt: &mut Option<Stt>,
+    settings: &crate::config::Settings,
+    ev_tx: &Sender<CoreEvent>,
+) {
+    let Some(api_key) = keychain::get_openai_api_key() else {
+        let _ = ev_tx.send(CoreEvent::Log(
+            "OpenAI API key not set — open Settings → Engine".into(),
+        ));
+        let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::NeedsApiKey));
+        return;
+    };
+    match OpenAiStt::new(
+        api_key,
+        settings.openai_model.clone(),
+        settings.openai_language.clone(),
+    ) {
+        Ok(client) => {
+            *stt = Some(Stt::OpenAi(client));
+            let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::Idle));
+            let _ = ev_tx.send(CoreEvent::Log(format!(
+                "OpenAI backend ready (model: {})",
+                settings.openai_model
+            )));
+            tracing::info!("OpenAI backend initialised, model={}", settings.openai_model);
+        }
+        Err(e) => {
+            tracing::error!("OpenAI backend init failed: {e:#}");
+            let _ = ev_tx.send(CoreEvent::Log(format!("OpenAI init failed: {e}")));
+            let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::NeedsApiKey));
+        }
+    }
+}
+
+fn load_parakeet(stt: &mut Option<Stt>, ev_tx: &Sender<CoreEvent>) {
     let paths = ModelPaths::new(parakeet_dir());
     tracing::info!("checking model at {}", paths.root.display());
     if !paths.is_complete() {
@@ -153,9 +215,9 @@ fn try_load_stt(stt: &mut Option<Stt>, ev_tx: &Sender<CoreEvent>) {
         let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::NeedsModel));
         return;
     }
-    match Stt::load(&paths) {
-        Ok(s) => {
-            let mut s = s;
+    match ParakeetStt::load(&paths) {
+        Ok(p) => {
+            let mut s = Stt::Parakeet(p);
             let load_log = match s.self_test(&paths) {
                 Ok(Some(text)) if text.is_empty() => {
                     tracing::warn!("Parakeet self-test produced an empty transcript");
@@ -177,7 +239,7 @@ fn try_load_stt(stt: &mut Option<Stt>, ev_tx: &Sender<CoreEvent>) {
             tracing::info!("Parakeet loaded from {}", paths.root.display());
         }
         Err(e) => {
-            tracing::error!("Stt::load failed: {e:#}");
+            tracing::error!("Parakeet::load failed: {e:#}");
             let _ = ev_tx.send(CoreEvent::Log(format!("model load failed: {e}")));
             let _ = ev_tx.send(CoreEvent::PhaseChanged(Phase::NeedsModel));
         }

@@ -15,10 +15,13 @@
 
 ## Features
 
-- **Offline ASR** — NVIDIA Parakeet TDT 0.6B v2 (int8) running locally via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). No network round-trip, no cloud, no logs leaving your machine.
+- **Two engines, one app** — switch in **Settings → Engine**:
+  - **OpenAI** (default) — small RAM footprint, sends audio to `api.openai.com/v1/audio/transcriptions`. Default model `gpt-4o-transcribe`; `gpt-4o-mini-transcribe` and `whisper-1` are also available. API key is stored in the macOS Keychain.
+  - **Parakeet (local)** — NVIDIA Parakeet TDT 0.6B v2 (int8) via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Fully offline, no cloud round-trip, ~2 GB resident at runtime.
 - **Push-to-talk** — global `CGEventTap` watches a configurable modifier; press to record, release to transcribe and paste.
 - **Menubar app** — no Dock icon (`LSUIElement`), settings window on demand.
 - **Transcript history** — local SQLite, browsable from Settings.
+- **In-app update notifier** — polls GitHub releases on startup and every 6 hours, surfaces a badge in **Settings → About** when a newer version is published.
 - **Native UI** — built on [GPUI](https://www.gpui.rs/) (Zed's renderer) with [gpui-component](https://github.com/longbridge/gpui-component).
 
 ## Install
@@ -43,9 +46,11 @@ On first launch, macOS will prompt you to grant:
 
 Both prompts come from System Settings → Privacy & Security.
 
-### First-run model download
+### First-run setup
 
-Yap pulls the Parakeet TDT v2 model (~600 MB) on first launch into:
+**OpenAI backend (default):** open **Settings → Engine**, paste your API key (`sk-…`), press **Save**. The key is written to the macOS Keychain under service `yap`, account `openai_api_key` — never to disk in plaintext. macOS may prompt you to allow Keychain access the first time.
+
+**Parakeet backend:** switch to it in **Settings → Engine**, then click **Download** to pull the ~600 MB model into:
 
 ```
 ~/Library/Application Support/yap/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/
@@ -130,7 +135,12 @@ Publishing the release fires `.github/workflows/release.yml`, which:
 |---|---|
 | `src/hotkey.rs` | `CGEventTap` flags-changed watcher → `HotkeyEvent { Pressed, Released }` |
 | `src/audio.rs` | `cpal` mic capture, 16 kHz mono PCM ring |
-| `src/stt.rs` + `src/model.rs` | sherpa-onnx Parakeet wrapper + model download |
+| `src/stt.rs` | Backend dispatcher (`Stt::Parakeet` / `Stt::OpenAi`) |
+| `src/stt/parakeet.rs` | sherpa-onnx Parakeet wrapper |
+| `src/stt/openai.rs` | `POST /v1/audio/transcriptions` multipart upload |
+| `src/keychain.rs` | macOS Keychain storage for the OpenAI API key |
+| `src/model.rs` | Parakeet model download |
+| `src/updater.rs` | GitHub-releases poller |
 | `src/text.rs` | Spoken-word normalisation (e.g. "dash dash release" → `--release`) |
 | `src/paste.rs` | Clipboard + simulated ⌘V paste |
 | `src/history.rs` | SQLite transcript log |

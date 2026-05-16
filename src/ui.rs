@@ -7,19 +7,22 @@ mod theme;
 
 use crossbeam_channel::{Receiver, Sender};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, hsla, px,
+    AnyElement, AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, hsla, px,
 };
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    input::{Input, InputState},
+    v_flex,
 };
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::config::{Hotkey, SharedSettings, parakeet_dir};
+use crate::config::{BackendKind, Hotkey, OPENAI_MODELS, SharedSettings, parakeet_dir};
 use crate::history::{RecordingSummary, history_path};
+use crate::keychain;
 use crate::state::{CoreCmd, CoreEvent, Phase};
 use crate::updater::{self, UpdateInfo};
 
@@ -28,18 +31,18 @@ const VU_BARS: usize = 7;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     General,
-    Model,
+    Engine,
     History,
     About,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 4] = [Self::General, Self::Model, Self::History, Self::About];
+    const ALL: [Self; 4] = [Self::General, Self::Engine, Self::History, Self::About];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Model => "Model",
+            Self::Engine => "Engine",
             Self::History => "History",
             Self::About => "About",
         }
@@ -48,7 +51,7 @@ impl SettingsSection {
     fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Input behavior and shortcuts.",
-            Self::Model => "Local speech recognition model.",
+            Self::Engine => "Choose where transcription runs.",
             Self::History => "Recent dictation sessions.",
             Self::About => "Build information.",
         }
@@ -166,6 +169,75 @@ impl AppModel {
     pub fn set_section(&mut self, section: SettingsSection) {
         self.section = section;
     }
+
+    pub fn set_backend(&mut self, backend: BackendKind) {
+        let changed = {
+            let mut settings = self.settings.write();
+            let changed = settings.backend != backend;
+            settings.backend = backend;
+            let _ = settings.save();
+            changed
+        };
+        if changed {
+            let _ = self.core_cmd_tx.send(CoreCmd::ReloadModel);
+            self.log = format!("Switched engine to {}", backend.label());
+        }
+    }
+
+    pub fn set_openai_model(&mut self, model: String) {
+        {
+            let mut settings = self.settings.write();
+            settings.openai_model = model.clone();
+            let _ = settings.save();
+        }
+        let _ = self.core_cmd_tx.send(CoreCmd::ReloadModel);
+        self.log = format!("OpenAI model set to {model}");
+    }
+
+    pub fn set_openai_language(&mut self, language: Option<String>) {
+        {
+            let mut settings = self.settings.write();
+            settings.openai_language = language.clone();
+            let _ = settings.save();
+        }
+        let _ = self.core_cmd_tx.send(CoreCmd::ReloadModel);
+        match language.as_deref() {
+            Some(lang) if !lang.is_empty() => {
+                self.log = format!("OpenAI language hint: {lang}");
+            }
+            _ => self.log = "OpenAI language hint: auto-detect".into(),
+        }
+    }
+
+    pub fn save_api_key(&mut self, key: String) {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            self.log = "API key is empty — nothing saved".into();
+            return;
+        }
+        match keychain::set_openai_api_key(&trimmed) {
+            Ok(()) => {
+                self.log = "OpenAI API key saved to Keychain".into();
+                let _ = self.core_cmd_tx.send(CoreCmd::ReloadModel);
+            }
+            Err(e) => {
+                self.log = format!("Failed to save API key: {e}");
+                tracing::error!("keychain save failed: {e:#}");
+            }
+        }
+    }
+
+    pub fn clear_api_key(&mut self) {
+        match keychain::clear_openai_api_key() {
+            Ok(()) => {
+                self.log = "OpenAI API key removed from Keychain".into();
+                let _ = self.core_cmd_tx.send(CoreCmd::ReloadModel);
+            }
+            Err(e) => {
+                self.log = format!("Failed to remove API key: {e}");
+            }
+        }
+    }
 }
 
 pub fn spawn_event_pump(app: Entity<AppModel>, core_rx: Receiver<CoreEvent>, cx: &mut gpui::App) {
@@ -214,6 +286,7 @@ impl Render for PillView {
             Phase::Recording => ("listening", hsla(0.0, 0.85, 0.60, 1.0)),
             Phase::Transcribing => ("transcribing…", theme::warn()),
             Phase::NeedsModel => ("model missing — see Settings", theme::text_tertiary()),
+            Phase::NeedsApiKey => ("OpenAI key missing — see Settings", theme::text_tertiary()),
             Phase::LoadingModel => unreachable!("handled above"),
         };
         let label: SharedString = label.into();
@@ -276,12 +349,41 @@ impl Render for PillView {
 
 pub struct SettingsView {
     app: Entity<AppModel>,
+    api_key_input: Entity<InputState>,
+    language_input: Entity<InputState>,
 }
 
 impl SettingsView {
-    pub fn new(app: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        app: Entity<AppModel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
-        Self { app }
+        let api_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("sk-…")
+                .masked(true)
+        });
+        let initial_lang = app
+            .read(cx)
+            .settings
+            .read()
+            .openai_language
+            .clone()
+            .unwrap_or_default();
+        let language_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("auto-detect");
+            if !initial_lang.is_empty() {
+                state.set_value(&initial_lang, window, cx);
+            }
+            state
+        });
+        Self {
+            app,
+            api_key_input,
+            language_input,
+        }
     }
 }
 
@@ -298,6 +400,9 @@ struct DetailData {
     last_transcript: String,
     history: Vec<RecordingSummary>,
     update_available: Option<UpdateInfo>,
+    backend: BackendKind,
+    openai_model: String,
+    api_key_hint: Option<String>,
 }
 
 impl Render for SettingsView {
@@ -318,17 +423,22 @@ impl Render for SettingsView {
                 last_transcript: model.last_transcript.clone(),
                 history: model.history.clone(),
                 update_available: model.update_available.clone(),
+                backend: settings.backend,
+                openai_model: settings.openai_model.clone(),
+                api_key_hint: keychain::openai_api_key_hint(),
             }
         };
 
         let app = self.app.clone();
+        let api_key_input = self.api_key_input.clone();
+        let language_input = self.language_input.clone();
 
         h_flex()
             .id("settings-root")
             .size_full()
             .text_color(theme::text_primary())
             .child(render_sidebar(app.clone(), data.section))
-            .child(render_detail(app, data))
+            .child(render_detail(app, data, api_key_input, language_input))
     }
 }
 
@@ -363,20 +473,30 @@ fn render_sidebar(app: Entity<AppModel>, current: SettingsSection) -> AnyElement
         .into_any_element()
 }
 
-fn render_detail(app: Entity<AppModel>, data: DetailData) -> AnyElement {
+fn render_detail(
+    app: Entity<AppModel>,
+    data: DetailData,
+    api_key_input: Entity<InputState>,
+    language_input: Entity<InputState>,
+) -> AnyElement {
     let section = data.section;
     let body: AnyElement = match section {
         SettingsSection::General => {
             render_general(app.clone(), data.hotkey, data.trailing_space)
         }
-        SettingsSection::Model => render_model_section(
+        SettingsSection::Engine => render_engine_section(
             app.clone(),
+            data.backend,
+            data.openai_model,
+            data.api_key_hint,
             data.phase,
             data.downloading,
             data.extracting,
             data.download_bytes,
             data.download_total,
             data.last_transcript,
+            api_key_input,
+            language_input,
         ),
         SettingsSection::History => render_history_section(data.history),
         SettingsSection::About => render_about_section(data.update_available),
@@ -469,6 +589,209 @@ fn render_general(app: Entity<AppModel>, selected_hotkey: Hotkey, trailing_space
             .child(form_row("Push-to-talk", hotkey_row))
             .child(divider_line())
             .child(form_row("Append trailing space", trailing_btn)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_engine_section(
+    app: Entity<AppModel>,
+    backend: BackendKind,
+    openai_model: String,
+    api_key_hint: Option<String>,
+    phase: Phase,
+    downloading: bool,
+    extracting: bool,
+    download_bytes: u64,
+    download_total: Option<u64>,
+    last_transcript: String,
+    api_key_input: Entity<InputState>,
+    language_input: Entity<InputState>,
+) -> AnyElement {
+    let backend_picker = h_flex().gap_2().children(BackendKind::ALL.map(|kind| {
+        let app = app.clone();
+        let mut btn = Button::new(SharedString::from(format!("backend-{:?}", kind)))
+            .label(kind.label());
+        if kind == backend {
+            btn = btn.primary();
+        } else {
+            btn = btn.outline();
+        }
+        btn.on_click(move |_, _, cx| {
+            app.update(cx, |m, cx| {
+                m.set_backend(kind);
+                cx.notify();
+            });
+        })
+    }));
+
+    let backend_card = group_card(
+        "Engine",
+        v_flex()
+            .gap_2()
+            .child(form_row("Backend", backend_picker))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_tertiary())
+                    .child(match backend {
+                        BackendKind::OpenAi => {
+                            "Uses the OpenAI transcription API. Audio is sent over HTTPS to api.openai.com."
+                        }
+                        BackendKind::Parakeet => {
+                            "Runs NVIDIA Parakeet TDT v2 locally via sherpa-onnx. Higher RAM, fully offline."
+                        }
+                    }),
+            ),
+    );
+
+    let body: AnyElement = match backend {
+        BackendKind::OpenAi => render_openai_subsection(
+            app,
+            openai_model,
+            api_key_hint,
+            api_key_input,
+            language_input,
+        ),
+        BackendKind::Parakeet => render_model_section(
+            app,
+            phase,
+            downloading,
+            extracting,
+            download_bytes,
+            download_total,
+            last_transcript,
+        ),
+    };
+
+    v_flex()
+        .gap_4()
+        .child(backend_card)
+        .child(body)
+        .into_any_element()
+}
+
+fn render_openai_subsection(
+    app: Entity<AppModel>,
+    selected_model: String,
+    api_key_hint: Option<String>,
+    api_key_input: Entity<InputState>,
+    language_input: Entity<InputState>,
+) -> AnyElement {
+    let key_row: AnyElement = match api_key_hint.clone() {
+        Some(hint) => {
+            let app_clear = app.clone();
+            let label: SharedString = hint.into();
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::text_secondary())
+                        .child(label),
+                )
+                .child(
+                    Button::new("clear-api-key")
+                        .label("Forget")
+                        .outline()
+                        .on_click(move |_, _, cx| {
+                            app_clear.update(cx, |m, cx| {
+                                m.clear_api_key();
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element()
+        }
+        None => {
+            let app_save = app.clone();
+            let input = api_key_input.clone();
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().w(px(280.0)).child(Input::new(&api_key_input)))
+                .child(
+                    Button::new("save-api-key")
+                        .label("Save")
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            let key = input.read(cx).value().to_string();
+                            app_save.update(cx, |m, cx| {
+                                m.save_api_key(key);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element()
+        }
+    };
+
+    let model_picker = h_flex().gap_2().children(OPENAI_MODELS.iter().copied().map(|name| {
+        let app = app.clone();
+        let owned: String = name.to_string();
+        let mut btn = Button::new(SharedString::from(format!("openai-model-{name}"))).label(name);
+        if selected_model == name {
+            btn = btn.primary();
+        } else {
+            btn = btn.outline();
+        }
+        btn.on_click(move |_, _, cx| {
+            let value = owned.clone();
+            app.update(cx, |m, cx| {
+                m.set_openai_model(value);
+                cx.notify();
+            });
+        })
+    }));
+
+    let language_row = {
+        let app = app.clone();
+        let input = language_input.clone();
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().w(px(120.0)).child(Input::new(&language_input)))
+            .child(
+                Button::new("save-language")
+                    .label("Apply")
+                    .outline()
+                    .on_click(move |_, _, cx| {
+                        let raw = input.read(cx).value().to_string();
+                        let trimmed = raw.trim().to_string();
+                        let lang = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        };
+                        app.update(cx, |m, cx| {
+                            m.set_openai_language(lang);
+                            cx.notify();
+                        });
+                    }),
+            )
+    };
+
+    let key_label: &'static str = if api_key_hint.is_some() {
+        "API key"
+    } else {
+        "API key (saved to Keychain)"
+    };
+
+    group_card(
+        "OpenAI",
+        v_flex()
+            .gap_4()
+            .child(form_row(key_label, key_row))
+            .child(divider_line())
+            .child(form_row("Model", model_picker))
+            .child(divider_line())
+            .child(form_row("Language (ISO-639-1)", language_row))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_tertiary())
+                    .child("Leave language blank for auto-detect."),
+            ),
     )
 }
 

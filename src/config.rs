@@ -42,9 +42,47 @@ pub struct Settings {
     /// Push-to-talk modifier key.
     #[serde(default)]
     pub hotkey: Hotkey,
+    /// Which STT engine to use.
+    #[serde(default)]
+    pub backend: BackendKind,
+    /// OpenAI transcription model id.
+    #[serde(default = "default_openai_model")]
+    pub openai_model: String,
+    /// Optional ISO-639-1 language hint passed to OpenAI. None = auto-detect.
+    #[serde(default)]
+    pub openai_language: Option<String>,
 }
 
 pub type SharedSettings = Arc<RwLock<Settings>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    #[default]
+    OpenAi,
+    Parakeet,
+}
+
+impl BackendKind {
+    pub const ALL: [BackendKind; 2] = [BackendKind::OpenAi, BackendKind::Parakeet];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendKind::OpenAi => "OpenAI (cloud)",
+            BackendKind::Parakeet => "Parakeet (local)",
+        }
+    }
+}
+
+pub const OPENAI_MODELS: &[&str] = &[
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+    "whisper-1",
+];
+
+fn default_openai_model() -> String {
+    "gpt-4o-transcribe".to_string()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -80,11 +118,18 @@ impl Settings {
     pub fn load() -> Self {
         match std::fs::read_to_string(settings_path()) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Self {
-                trailing_space: true,
-                min_samples: 16_000 / 4,
-                hotkey: Hotkey::Fn,
-            },
+            Err(_) => Self::fresh_defaults(),
+        }
+    }
+
+    fn fresh_defaults() -> Self {
+        Self {
+            trailing_space: true,
+            min_samples: 16_000 / 4,
+            hotkey: Hotkey::Fn,
+            backend: BackendKind::OpenAi,
+            openai_model: default_openai_model(),
+            openai_language: None,
         }
     }
 
@@ -119,9 +164,29 @@ mod tests {
             trailing_space: true,
             min_samples: 4000,
             hotkey: Hotkey::Option,
+            backend: super::BackendKind::OpenAi,
+            openai_model: super::default_openai_model(),
+            openai_language: None,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.hotkey, Hotkey::Option);
+    }
+
+    #[test]
+    fn defaults_to_openai_backend() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(matches!(s.backend, super::BackendKind::OpenAi));
+        assert_eq!(s.openai_model, "gpt-4o-transcribe");
+        assert!(s.openai_language.is_none());
+    }
+
+    #[test]
+    fn legacy_settings_without_backend_default_to_openai() {
+        let s: Settings = serde_json::from_str(
+            r#"{"trailing_space":true,"min_samples":4000,"hotkey":"fn"}"#,
+        )
+        .unwrap();
+        assert!(matches!(s.backend, super::BackendKind::OpenAi));
     }
 }

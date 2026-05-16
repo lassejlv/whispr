@@ -1,86 +1,175 @@
-use anyhow::{Context, Result};
-use crossbeam_channel::Sender;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+//! macOS menubar tray: NSStatusBar item with Settings / Quit menu.
 
-pub enum TrayEvent {
-    OpenSettings,
-    Quit,
-}
+#[cfg(target_os = "macos")]
+mod imp {
+    use crossbeam_channel::Sender;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, sel};
+    use objc2_app_kit::{
+        NSAppearance, NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSStatusBar,
+    };
+    use objc2_foundation::{MainThreadMarker, NSString};
+    use std::sync::OnceLock;
 
-pub struct Tray {
-    _icon: TrayIcon,
-}
+    use crate::state::UiCmd;
 
-pub fn spawn(tx: Sender<TrayEvent>) -> Result<Tray> {
-    let menu = Menu::new();
+    static TRAY_TX: OnceLock<Sender<UiCmd>> = OnceLock::new();
 
-    let open = MenuItem::new("Open Settings", true, None);
-    let separator = PredefinedMenuItem::separator();
-    let quit = MenuItem::new("Quit Whispr", true, None);
+    declare_class!(
+        struct TrayTarget;
 
-    let open_id = open.id().clone();
-    let quit_id = quit.id().clone();
+        unsafe impl ClassType for TrayTarget {
+            type Super = NSObject;
+            type Mutability = mutability::InteriorMutable;
+            const NAME: &'static str = "WhisprTrayTarget";
+        }
 
-    menu.append_items(&[&open, &separator, &quit])
-        .context("build tray menu")?;
+        impl DeclaredClass for TrayTarget {}
 
-    let icon = TrayIconBuilder::new()
-        .with_tooltip("Whispr")
-        .with_icon(build_icon())
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(true)
-        .build()
-        .context("build tray icon")?;
-
-    std::thread::Builder::new()
-        .name("whispr-tray".into())
-        .spawn(move || {
-            let receiver = MenuEvent::receiver();
-            while let Ok(event) = receiver.recv() {
-                let send = if event.id == open_id {
-                    tx.send(TrayEvent::OpenSettings)
-                } else if event.id == quit_id {
-                    tx.send(TrayEvent::Quit)
-                } else {
-                    Ok(())
-                };
-                if send.is_err() {
-                    break;
+        unsafe impl TrayTarget {
+            #[method(openSettings:)]
+            fn open_settings(&self, _sender: Option<&AnyObject>) {
+                if let Some(tx) = TRAY_TX.get() {
+                    let _ = tx.send(UiCmd::OpenSettings);
                 }
             }
-        })?;
 
-    Ok(Tray { _icon: icon })
-}
-
-fn build_icon() -> Icon {
-    let size = 22u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let cx = size as f32 / 2.0;
-    let cy = size as f32 / 2.0;
-    let r_outer = size as f32 / 2.0 - 1.0;
-    let r_inner = r_outer - 4.0;
-
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            let d = (dx * dx + dy * dy).sqrt();
-            let idx = ((y * size + x) * 4) as usize;
-            if d <= r_outer && d >= r_inner {
-                rgba[idx] = 0xf9;
-                rgba[idx + 1] = 0xfa;
-                rgba[idx + 2] = 0xfb;
-                rgba[idx + 3] = 0xff;
-            } else if d <= r_inner - 2.0 {
-                rgba[idx] = 0xef;
-                rgba[idx + 1] = 0x44;
-                rgba[idx + 2] = 0x44;
-                rgba[idx + 3] = 0xff;
+            #[method(quit:)]
+            fn quit(&self, _sender: Option<&AnyObject>) {
+                if let Some(tx) = TRAY_TX.get() {
+                    let _ = tx.send(UiCmd::Quit);
+                }
             }
+
+            #[method(hideWhispr:)]
+            fn hide_whispr(&self, _sender: Option<&AnyObject>) {
+                if let Some(tx) = TRAY_TX.get() {
+                    let _ = tx.send(UiCmd::Hide);
+                }
+            }
+        }
+    );
+
+    /// Install the menubar item. Must be called on the main thread.
+    /// Returned status item is leaked so it lives for app lifetime.
+    pub fn install(tx: Sender<UiCmd>) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            tracing::error!("tray install must run on main thread");
+            return;
+        };
+        let _ = TRAY_TX.set(tx);
+
+        force_dark_appearance(mtm);
+
+        let target: Retained<TrayTarget> = unsafe { msg_send_id![TrayTarget::alloc(), init] };
+
+        install_app_menu(mtm, &target);
+        let bar = unsafe { NSStatusBar::systemStatusBar() };
+        // -1.0 == NSVariableStatusItemLength
+        let item = unsafe { bar.statusItemWithLength(-1.0) };
+
+        if let Some(button) = unsafe { item.button(mtm) } {
+            unsafe { button.setTitle(&NSString::from_str("●")) };
+        }
+
+        let menu = NSMenu::new(mtm);
+
+        let settings_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Settings…"),
+                Some(sel!(openSettings:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { settings_item.setTarget(Some(&*target)) };
+        menu.addItem(&settings_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let quit_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Quit whispr"),
+                Some(sel!(quit:)),
+                &NSString::from_str("q"),
+            )
+        };
+        unsafe { quit_item.setTarget(Some(&*target)) };
+        menu.addItem(&quit_item);
+
+        unsafe { item.setMenu(Some(&menu)) };
+
+        // Intentionally leak so the status item + target survive process lifetime.
+        std::mem::forget(target);
+        std::mem::forget(item);
+    }
+
+    fn force_dark_appearance(mtm: MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        let name = NSString::from_str("NSAppearanceNameDarkAqua");
+        if let Some(appearance) = NSAppearance::appearanceNamed(&name) {
+            app.setAppearance(Some(&appearance));
         }
     }
 
-    Icon::from_rgba(rgba, size, size).expect("valid icon rgba")
+    fn install_app_menu(mtm: MainThreadMarker, target: &TrayTarget) {
+        let main_menu = NSMenu::new(mtm);
+        let app_menu_item = NSMenuItem::new(mtm);
+        main_menu.addItem(&app_menu_item);
+
+        let app_menu = NSMenu::new(mtm);
+        let settings_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Settings…"),
+                Some(sel!(openSettings:)),
+                &NSString::from_str(","),
+            )
+        };
+        unsafe { settings_item.setTarget(Some(target)) };
+        settings_item
+            .setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+        app_menu.addItem(&settings_item);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let hide_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Hide whispr"),
+                Some(sel!(hideWhispr:)),
+                &NSString::from_str("m"),
+            )
+        };
+        unsafe { hide_item.setTarget(Some(target)) };
+        hide_item.setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+        app_menu.addItem(&hide_item);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let quit_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc::<NSMenuItem>(),
+                &NSString::from_str("Quit whispr"),
+                Some(sel!(quit:)),
+                &NSString::from_str("q"),
+            )
+        };
+        unsafe { quit_item.setTarget(Some(target)) };
+        quit_item.setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+        app_menu.addItem(&quit_item);
+
+        app_menu_item.setSubmenu(Some(&app_menu));
+        NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
+    }
 }
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use crate::state::UiCmd;
+    use crossbeam_channel::Sender;
+
+    pub fn install(_tx: Sender<UiCmd>) {}
+}
+
+pub use imp::install;
